@@ -15,6 +15,7 @@ flowchart TD
     A --> I[CompareDAO]
     A --> J[HistoryDAO]
     A --> K[RemoveDAO]
+    A --> L[ReviewQueueDAO]
     
     E --> B
     F --> B
@@ -23,6 +24,7 @@ flowchart TD
     I --> B
     J --> B
     K --> B
+    L --> B
 ```
 
 ## 2. ER 图
@@ -89,6 +91,32 @@ erDiagram
     REMOVE {
         BIGINT id PK "移除记录ID"
     }
+    REVIEW_QUEUE {
+        BIGINT id PK "复核单主键"
+        BIGINT flaw_id UK "关联 FLAW.id（唯一）"
+        VARCHAR status "PENDING/ASSIGNED/APPROVED/REJECTED"
+        VARCHAR assignee "当前负责人"
+        VARCHAR assigned_by "指派人/转派操作者"
+        DATETIME assigned_at "指派/转派时间"
+        VARCHAR concluded_by "结论提交人"
+        DATETIME concluded_at "结论时间"
+        VARCHAR conclusion_note "结论说明"
+        INT version "状态版本号"
+    }
+    REVIEW_ACTION_LOG {
+        BIGINT id PK "轨迹流水主键"
+        BIGINT review_id FK "关联 REVIEW_QUEUE.id"
+        BIGINT flaw_id "冗余 FLAW.id"
+        INT seq "单内严格递增序号"
+        VARCHAR action "ASSIGN/REASSIGN/APPROVE/REJECT"
+        VARCHAR from_status "操作前状态"
+        VARCHAR to_status "操作后状态"
+        VARCHAR from_assignee "操作前负责人"
+        VARCHAR to_assignee "操作后负责人"
+        VARCHAR operator "操作者"
+        VARCHAR reason "理由（转派/驳回强制非空）"
+        DATETIME created_at "操作时间"
+    }
 
     FLAW ||--o{ STOP : "损伤触发停机"
     SPLICE ||--o{ STOP : "接缝触发停机"
@@ -96,6 +124,8 @@ erDiagram
     SPLICE ||--o{ COMPARE : "接缝对比"
     FLAW ||--o{ HISTORY : "损伤归档"
     FLAW ||--o{ REMOVE : "损伤移除"
+    FLAW |o--|| REVIEW_QUEUE : "一损伤至多一复核单"
+    REVIEW_QUEUE ||--o{ REVIEW_ACTION_LOG : "复核责任轨迹"
 ```
 
 ## 3. 模块清单

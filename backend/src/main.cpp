@@ -16,6 +16,7 @@
 #include "config/AppConfig.h"
 #include "utils/Logger.h"
 #include "db/DatabaseManager.h"
+#include "db/Connection.h"
 #include "dao/SpeedDAO.h"
 #include "dao/SpliceDAO.h"
 #include "dao/FlawDAO.h"
@@ -23,6 +24,11 @@
 #include "dao/CompareDAO.h"
 #include "dao/HistoryDAO.h"
 #include "dao/RemoveDAO.h"
+#include "dao/ReviewQueueDAO.h"
+
+#include <thread>
+#include <atomic>
+#include <chrono>
 
 using namespace std;
 
@@ -260,6 +266,124 @@ static void demoRemove(dao::RemoveDAO& removeDao) {
     printResult("DELETE all test records", true);
 }
 
+static void demoReview(dao::FlawDAO& flawDao) {
+    printSeparator("REVIEW_QUEUE 复核队列（指派/转派/结论 + 责任轨迹）");
+
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    db::Connection conn(cfg);
+    dao::ReviewQueueDAO reviewDao;
+
+    auto buildFlaw = []() {
+        entity::Flaw f;
+        f.category = "crack"; f.level = 3; f.url = "/data/flaw/night.jpg";
+        f.camera = 2; f.location = 2500.0f; f.distance = 180.0f;
+        f.size = "15x8mm"; f.coordinate = "X:120,Y:340";
+        f.date = "2026-09-21"; f.time = 30.5f; f.flag = 0; f.stop = 0; f.epoch = 1;
+        return f;
+    };
+
+    // 一条夜班遗留损伤入队
+    long long flawId = flawDao.insert(buildFlaw());
+    long long reviewId = 0;
+
+    auto en = reviewDao.enlist(conn, flawId);
+    reviewId = en.reviewId;
+    printResult("ENLIST flaw=" + to_string(flawId) + " -> review=" + to_string(reviewId), en.ok());
+
+    // 同一缺陷重复入队：返回可区分结果
+    auto dup = reviewDao.enlist(conn, flawId);
+    printResult("DUPLICATE enlist -> " + string(dao::reviewErrorName(dup.code)),
+                dup.code == dao::ReviewError::AlreadyEnlisted);
+
+    // 主管首次指派
+    auto a1 = reviewDao.assign(conn, reviewId, "sup_zhang", "alice", "");
+    printResult("ASSIGN -> alice by sup_zhang", a1.ok());
+
+    // 工程师离岗，主管转派（必须带理由）
+    auto noReason = reviewDao.assign(conn, reviewId, "sup_zhang", "bob", "");
+    printResult("REASSIGN without reason -> " + string(dao::reviewErrorName(noReason.code)),
+                noReason.code == dao::ReviewError::EmptyReason);
+    auto a2 = reviewDao.assign(conn, reviewId, "sup_zhang", "bob", "夜班工程师离岗交接");
+    printResult("REASSIGN -> bob（带理由）", a2.ok());
+
+    // 旧负责人已失效，只有当前负责人能提交结论
+    auto stale = reviewDao.conclude(conn, reviewId, "alice", true, "");
+    printResult("STALE owner alice conclude -> " + string(dao::reviewErrorName(stale.code)),
+                stale.code == dao::ReviewError::NotOwner);
+
+    // 当前负责人驳回（必须带理由）
+    auto rej = reviewDao.conclude(conn, reviewId, "bob", false, "证据不足，需补拍");
+    printResult("REJECT by bob（带理由）", rej.ok());
+
+    // 驳回后必须由主管重新指派才能再出结论
+    auto pending = reviewDao.conclude(conn, reviewId, "bob", false, "重送驳回");
+    printResult("RESEND on REJECTED -> " + string(dao::reviewErrorName(pending.code)),
+                pending.code == dao::ReviewError::RejectedPendingReassign);
+    auto a3 = reviewDao.assign(conn, reviewId, "sup_li", "carol", "驳回件升级给资深复核");
+    printResult("REASSIGN after reject -> carol（带理由）", a3.ok());
+    auto ap = reviewDao.conclude(conn, reviewId, "carol", true, "现场复核确认，通过");
+    printResult("APPROVE by carol", ap.ok());
+
+    // 客户端重送已形成的结论：可区分，不新增轨迹
+    auto resend = reviewDao.conclude(conn, reviewId, "carol", true, "现场复核确认，通过");
+    printResult("CLIENT RESEND -> " + string(dao::reviewErrorName(resend.code)),
+                resend.code == dao::ReviewError::AlreadyConcluded);
+
+    // 打印完整责任轨迹
+    auto log = reviewDao.findActions(reviewId);
+    cout << "  Responsibility trail (" << log.size() << " events):" << endl;
+    for (auto& e : log) {
+        cout << "    seq=" << e.seq << " " << e.action
+             << " " << (e.fromAssignee.empty() ? "-" : e.fromAssignee)
+             << " -> " << (e.toAssignee.empty() ? "-" : e.toAssignee)
+             << " by " << e.oper
+             << " [" << (e.fromStatus.empty() ? "-" : e.fromStatus)
+             << "=>" << e.toStatus << "]"
+             << (e.reason.empty() ? "" : (" reason=" + e.reason))
+             << "  at " << e.createdAt << endl;
+    }
+
+    // 并发提交实证：三线程同时提交，只允许一个有效结论
+    cout << "\n  Concurrent submit proof:" << endl;
+    long long f2 = flawDao.insert(buildFlaw());
+    auto e2 = reviewDao.enlist(conn, f2);
+    reviewDao.assign(conn, e2.reviewId, "sup1", "alice", "");
+
+    atomic<int> ready{0}, okN{0}, dupN{0};
+    atomic<bool> go{false};
+    vector<thread> ths;
+    for (int i = 0; i < 3; ++i) {
+        ths.emplace_back([&]() {
+            db::Connection c(cfg);
+            dao::ReviewQueueDAO d;
+            ready.fetch_add(1);
+            while (!go.load()) this_thread::sleep_for(chrono::milliseconds(2));
+            auto r = d.conclude(c, e2.reviewId, "alice", true, "concurrent");
+            if (r.code == dao::ReviewError::Ok) okN.fetch_add(1);
+            else if (r.code == dao::ReviewError::AlreadyConcluded) dupN.fetch_add(1);
+        });
+    }
+    while (ready.load() < 3) this_thread::sleep_for(chrono::milliseconds(2));
+    go.store(true);
+    for (auto& t : ths) t.join();
+    cout << "    3 concurrent submits -> OK=" << okN.load()
+         << ", ALREADY_CONCLUDED=" << dupN.load() << endl;
+    auto final2 = reviewDao.findById(e2.reviewId);
+    cout << "    final status=" << final2->status
+         << ", concluded_by=" << final2->concludedBy
+         << ", version=" << final2->version << endl;
+    printResult("Exactly one valid conclusion", okN.load() == 1 && dupN.load() == 2);
+
+    // 清理演示数据（先轨迹、再队列、后损伤，遵守外键）
+    db::DatabaseManager::instance().execute("DELETE FROM REVIEW_ACTION_LOG WHERE review_id IN ("
+        + to_string(reviewId) + "," + to_string(e2.reviewId) + ")");
+    db::DatabaseManager::instance().execute("DELETE FROM REVIEW_QUEUE WHERE id IN ("
+        + to_string(reviewId) + "," + to_string(e2.reviewId) + ")");
+    flawDao.deleteById(flawId);
+    flawDao.deleteById(f2);
+}
+
 // ============================================
 // 主入口
 // ============================================
@@ -298,6 +422,7 @@ int main() {
         demoCompare(compareDao);
         demoHistory(historyDao);
         demoRemove(removeDao);
+        demoReview(flawDao);
 
         // 6. 关闭连接
         db::DatabaseManager::instance().close();
