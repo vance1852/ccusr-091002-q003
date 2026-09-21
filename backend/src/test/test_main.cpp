@@ -20,14 +20,21 @@
 #include "../dao/CompareDAO.h"
 #include "../dao/HistoryDAO.h"
 #include "../dao/RemoveDAO.h"
+#include "../dao/ReviewDAO.h"
 
 #include <cstdlib>
+#include <thread>
+#include <atomic>
+#include <set>
 
 // ============================================
 // 辅助：清理所有表
 // ============================================
 static void cleanAllTables() {
     auto& dbm = db::DatabaseManager::instance();
+    // 复核表带外键，必须先于 FLAW 清理
+    dbm.execute("DELETE FROM REVIEW_EVENT");
+    dbm.execute("DELETE FROM REVIEW_TASK");
     dbm.execute("DELETE FROM SPEED");
     dbm.execute("DELETE FROM SPLICE");
     dbm.execute("DELETE FROM FLAW");
@@ -897,6 +904,382 @@ TEST(RemoveDAO_Count) {
     dao.insert();
     dao.insert();
     ASSERT_EQ(dao.count(), 3);
+}
+
+// ============================================
+// 11. ReviewDAO 复核队列测试
+// ============================================
+
+static long long insertFlawForReview(const std::string& cat = "crack", int lvl = 3, int cam = 2) {
+    dao::FlawDAO flawDao;
+    return flawDao.insert(makeFlaw(cat, lvl, cam, "2026-09-21"));
+}
+
+TEST(Review_EnqueueAndTrailCreate) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long flawId = insertFlawForReview();
+    auto out = dao.enqueue(flawId, "night_algorithm");
+    ASSERT_EQ(out.result, dao::EnqueueResult::OK);
+    ASSERT_GT(out.taskId, 0LL);
+
+    auto task = dao.findById(out.taskId);
+    ASSERT_TRUE(task.has_value());
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::PENDING);
+    ASSERT_TRUE(task->assignee.empty());
+
+    auto events = dao.findEvents(out.taskId);
+    ASSERT_EQ(events.size(), (size_t)1);
+    ASSERT_STR_EQ(events[0].eventType, entity::reviewevent::CREATE);
+    ASSERT_STR_EQ(events[0].actor, "night_algorithm");
+    ASSERT_EQ(events[0].flawId, flawId);
+}
+
+TEST(Review_EnqueueNonexistentFlaw) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    auto out = dao.enqueue(-999, "night_algorithm");
+    ASSERT_EQ(out.result, dao::EnqueueResult::FLAW_NOT_FOUND);
+}
+
+TEST(Review_DuplicateEnqueueRejected) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long flawId = insertFlawForReview();
+    ASSERT_EQ(dao.enqueue(flawId).result, dao::EnqueueResult::OK);
+    // 同一缺陷反复入队（不同人的待办里重复出现的根因）必须被挡住
+    ASSERT_EQ(dao.enqueue(flawId).result, dao::EnqueueResult::ALREADY_QUEUED);
+    ASSERT_EQ(dao.countByStatus(entity::reviewstatus::PENDING), 1);
+}
+
+TEST(Review_AssignRecordsOperatorAndTime) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+
+    ASSERT_EQ(dao.assign(taskId, "supervisor_bai", "alice"),
+              dao::AssignResult::OK);
+
+    auto task = dao.findById(taskId);
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::ASSIGNED);
+    ASSERT_STR_EQ(task->assignee, "alice");
+    ASSERT_STR_EQ(task->assignedBy, "supervisor_bai");
+    ASSERT_FALSE(task->assignedAt.empty());
+    ASSERT_EQ(task->version, 1);
+
+    auto events = dao.findEvents(taskId);
+    ASSERT_EQ(events.size(), (size_t)2);
+    ASSERT_STR_EQ(events[1].eventType, entity::reviewevent::ASSIGN);
+    ASSERT_STR_EQ(events[1].actor, "supervisor_bai");
+    ASSERT_STR_EQ(events[1].toAssignee, "alice");
+    ASSERT_TRUE(events[1].fromAssignee.empty());
+}
+
+TEST(Review_AssignTaskNotFoundAndEmptyAssignee) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    ASSERT_EQ(dao.assign(-999, "bob", "alice"), dao::AssignResult::TASK_NOT_FOUND);
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    ASSERT_THROWS(dao.assign(taskId, "bob", ""), std::invalid_argument);
+}
+
+TEST(Review_ReassignMustUseTransferWithReason) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    ASSERT_EQ(dao.assign(taskId, "supervisor_bai", "alice"), dao::AssignResult::OK);
+    // 已指派后不能再用无理由指派换人；必须转派并给理由
+    ASSERT_EQ(dao.assign(taskId, "supervisor_bai", "carol"),
+              dao::AssignResult::INVALID_TRANSITION);
+    // 结论已下的任务也不能再指派
+    ASSERT_EQ(dao.decide(taskId, "alice", true).result,
+              dao::DecisionResult::SUBMITTED);
+    ASSERT_EQ(dao.assign(taskId, "supervisor_bai", "carol"),
+              dao::AssignResult::INVALID_TRANSITION);
+}
+
+TEST(Review_TransferRequiresReason) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    // DAO 层拦截空白理由
+    ASSERT_THROWS(dao.transfer(taskId, "supervisor_bai", "carol", "   "),
+                  std::invalid_argument);
+}
+
+TEST(Review_TransferRejectsEmptyReasonAtDatabase) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long flawId = insertFlawForReview();
+    long long taskId = dao.enqueue(flawId).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    // 绕过 DAO 直写：数据库 CHECK 约束仍须拒绝无理由的驳回/转派
+    ASSERT_THROWS(
+        db::DatabaseManager::instance().execute(
+            "INSERT INTO REVIEW_EVENT (task_id, flaw_id, event_type, actor, reason) VALUES ("
+            + std::to_string(taskId) + ", " + std::to_string(flawId)
+            + ", 'REJECT', 'alice', '')"),
+        db::DatabaseException);
+}
+
+TEST(Review_DecideOnlyByCurrentOwner) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+
+    // 尚未指派时任何人都不能提交
+    ASSERT_EQ(dao.decide(taskId, "alice", true).result,
+              dao::DecisionResult::NOT_OWNER);
+
+    dao.assign(taskId, "supervisor_bai", "alice");
+
+    // 非当前负责人（离岗同事冒名 / 错误客户端）
+    ASSERT_EQ(dao.decide(taskId, "bob", true).result,
+              dao::DecisionResult::NOT_OWNER);
+
+    // 当前负责人提交通过
+    auto ok = dao.decide(taskId, "alice", true);
+    ASSERT_EQ(ok.result, dao::DecisionResult::SUBMITTED);
+
+    auto task = dao.findById(taskId);
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::APPROVED);
+    ASSERT_STR_EQ(task->decisionBy, "alice");
+    ASSERT_FALSE(task->decisionAt.empty());
+}
+
+TEST(Review_RejectRequiresReasonAndRecordsIt) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    ASSERT_THROWS(dao.decide(taskId, "alice", false, "  "), std::invalid_argument);
+
+    auto out = dao.decide(taskId, "alice", false, "坐标与实际位置不符");
+    ASSERT_EQ(out.result, dao::DecisionResult::SUBMITTED);
+    auto task = dao.findById(taskId);
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::REJECTED);
+    auto events = dao.findEvents(taskId);
+    ASSERT_STR_EQ(events.back().eventType, entity::reviewevent::REJECT);
+    ASSERT_STR_EQ(events.back().reason, "坐标与实际位置不符");
+}
+
+TEST(Review_ClientResendGetsAlreadyDecided) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    ASSERT_EQ(dao.decide(taskId, "alice", true).result,
+              dao::DecisionResult::SUBMITTED);
+    // 客户端重送相同结论：必须与"负责人失效"区分开
+    ASSERT_EQ(dao.decide(taskId, "alice", true).result,
+              dao::DecisionResult::ALREADY_DECIDED);
+    // 任务不存在又是另一种结果
+    ASSERT_EQ(dao.decide(-999, "alice", true).result,
+              dao::DecisionResult::TASK_NOT_FOUND);
+}
+
+TEST(Review_TransferredAwayOwnerCannotDecide) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview()).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    // 工程师离岗，任务转派给 carol
+    ASSERT_EQ(dao.transfer(taskId, "supervisor_bai", "carol",
+                           "alice 离岗，由 carol 接手"),
+              dao::AssignResult::OK);
+    // 旧负责人 alice 的在途结论到达：明确告知负责人失效
+    ASSERT_EQ(dao.decide(taskId, "alice", true).result,
+              dao::DecisionResult::NOT_OWNER);
+    // 已结论任务不允许再转派
+    dao.decide(taskId, "carol", true);
+    ASSERT_EQ(dao.transfer(taskId, "supervisor_bai", "dave", "再转一次"),
+              dao::AssignResult::INVALID_TRANSITION);
+}
+
+// 验收主线：一条经历转派的记录，责任轨迹完整
+TEST(Review_FullTransferResponsibilityTrail) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long flawId = insertFlawForReview("crack", 4, 7);
+    long long taskId = dao.enqueue(flawId, "night_algorithm").taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    dao.transfer(taskId, "supervisor_bai", "carol", "alice 离岗，转交夜班复核");
+    auto decided = dao.decide(taskId, "carol", false, "图像证据不足，驳回重采");
+    ASSERT_EQ(decided.result, dao::DecisionResult::SUBMITTED);
+
+    auto events = dao.findEvents(taskId);
+    ASSERT_EQ(events.size(), (size_t)4);
+
+    ASSERT_STR_EQ(events[0].eventType, entity::reviewevent::CREATE);
+    ASSERT_STR_EQ(events[0].actor, "night_algorithm");
+    ASSERT_TRUE(events[0].fromAssignee.empty());
+    ASSERT_TRUE(events[0].toAssignee.empty());
+
+    ASSERT_STR_EQ(events[1].eventType, entity::reviewevent::ASSIGN);
+    ASSERT_STR_EQ(events[1].actor, "supervisor_bai");
+    ASSERT_STR_EQ(events[1].toAssignee, "alice");
+
+    ASSERT_STR_EQ(events[2].eventType, entity::reviewevent::TRANSFER);
+    ASSERT_STR_EQ(events[2].actor, "supervisor_bai");
+    ASSERT_STR_EQ(events[2].fromAssignee, "alice");
+    ASSERT_STR_EQ(events[2].toAssignee, "carol");
+    ASSERT_STR_EQ(events[2].reason, "alice 离岗，转交夜班复核");
+    ASSERT_FALSE(events[2].createdAt.empty());
+
+    ASSERT_STR_EQ(events[3].eventType, entity::reviewevent::REJECT);
+    ASSERT_STR_EQ(events[3].actor, "carol");
+    ASSERT_STR_EQ(events[3].reason, "图像证据不足，驳回重采");
+
+    // 按缺陷直查轨迹与按任务直查一致
+    auto byFlaw = dao.findEventsByFlaw(flawId);
+    ASSERT_EQ(byFlaw.size(), events.size());
+
+    auto task = dao.findById(taskId);
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::REJECTED);
+    ASSERT_STR_EQ(task->assignee, "carol");
+    ASSERT_STR_EQ(task->decisionBy, "carol");
+    ASSERT_STR_EQ(task->assignedBy, "supervisor_bai");
+}
+
+// 主管翻页：级别 / 摄像头 / 负责人三个维度都不漏不重
+TEST(Review_KeysetPaginationNoGapsNoDuplicates) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    // 30 条：级别 1/2/3 各 10，摄像头 1/2 交替，奇数号指派 alice 偶数号指派 bob
+    for (int i = 0; i < 30; ++i) {
+        int lvl = (i % 3) + 1;
+        int cam = (i % 2) + 1;
+        long long taskId = dao.enqueue(insertFlawForReview("crack", lvl, cam)).taskId;
+        const std::string who = (i % 2 == 0) ? "alice" : "bob";
+        ASSERT_EQ(dao.assign(taskId, "supervisor_bai", who), dao::AssignResult::OK);
+    }
+
+    auto collectAssignee = [&](const std::string& who) {
+        std::vector<long long> ids;
+        long long cursor = 0;
+        while (true) {
+            auto page = dao.pageByAssignee(who, "", cursor, 5);
+            for (auto& it : page.items) {
+                ASSERT_STR_EQ(it.task.assignee, who);
+                ids.push_back(it.task.id);
+            }
+            if (!page.hasMore) break;
+            cursor = page.nextCursor;
+            ASSERT_GT(cursor, 0LL);
+        }
+        return ids;
+    };
+
+    auto alice = collectAssignee("alice");
+    auto bob = collectAssignee("bob");
+    ASSERT_EQ(alice.size(), (size_t)15);
+    ASSERT_EQ(bob.size(), (size_t)15);
+
+    auto collectLevel = [&](int lvl) {
+        std::vector<long long> ids;
+        long long cursor = 0;
+        while (true) {
+            auto page = dao.pageByLevel(lvl, "", cursor, 7);
+            for (auto& it : page.items) {
+                ASSERT_EQ(it.task.level, lvl);
+                ids.push_back(it.task.id);
+            }
+            if (!page.hasMore) break;
+            cursor = page.nextCursor;
+        }
+        return ids;
+    };
+    ASSERT_EQ(collectLevel(1).size(), (size_t)10);
+    ASSERT_EQ(collectLevel(2).size(), (size_t)10);
+    ASSERT_EQ(collectLevel(3).size(), (size_t)10);
+
+    // 全量分页：不漏不重，严格按 id 倒序
+    std::set<long long> seen;
+    long long cursor = 0, prev = 1LL << 60;
+    int total = 0;
+    while (true) {
+        auto page = dao.pageAll("", cursor, 8);
+        for (auto& it : page.items) {
+            ASSERT_TRUE(seen.insert(it.task.id).second); // 重复即失败
+            ASSERT_LT(it.task.id, prev);                  // 倒序连续
+            prev = it.task.id;
+            ++total;
+        }
+        if (!page.hasMore) break;
+        cursor = page.nextCursor;
+    }
+    ASSERT_EQ(total, 30);
+
+    // 摄像头维度 + 状态过滤组合
+    auto cam1Approved = dao.pageByCamera(1, entity::reviewstatus::APPROVED, 0, 50);
+    ASSERT_EQ(cam1Approved.items.size(), (size_t)0);
+    auto cam1Assigned = dao.pageByCamera(1, entity::reviewstatus::ASSIGNED, 0, 50);
+    ASSERT_EQ(cam1Assigned.items.size(), (size_t)15);
+}
+
+// 并发提交：两条独立连接同时提交，只形成一个有效结论
+TEST(Review_ConcurrentDecisionOnlyOneWins) {
+    cleanAllTables();
+    dao::ReviewDAO mainDao;
+    long long taskId = mainDao.enqueue(insertFlawForReview()).taskId;
+    mainDao.assign(taskId, "supervisor_bai", "alice");
+
+    config::DatabaseConfig cfg;
+    cfg.loadFromEnv();
+    auto connA = db::DatabaseManager::openConnection(cfg);
+    auto connB = db::DatabaseManager::openConnection(cfg);
+    dao::ReviewDAO daoA(connA.get());
+    dao::ReviewDAO daoB(connB.get());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    dao::DecisionResult ra = dao::DecisionResult::TASK_NOT_FOUND;
+    dao::DecisionResult rb = dao::DecisionResult::TASK_NOT_FOUND;
+
+    auto worker = [&](dao::ReviewDAO& d, dao::DecisionResult& r) {
+        ++ready;
+        while (!go.load()) { std::this_thread::yield(); }
+        r = d.decide(taskId, "alice", true).result;
+    };
+
+    std::thread ta(worker, std::ref(daoA), std::ref(ra));
+    std::thread tb(worker, std::ref(daoB), std::ref(rb));
+    while (ready.load() < 2) { std::this_thread::yield(); }
+    go.store(true);
+    ta.join();
+    tb.join();
+
+    int submitted = (ra == dao::DecisionResult::SUBMITTED) + (rb == dao::DecisionResult::SUBMITTED);
+    int duplicate = (ra == dao::DecisionResult::ALREADY_DECIDED) + (rb == dao::DecisionResult::ALREADY_DECIDED);
+    ASSERT_EQ(submitted, 1);
+    ASSERT_EQ(duplicate, 1);
+
+    // 只落了一条 APPROVE 事件，任务只被更新一次
+    auto events = mainDao.findEvents(taskId);
+    int approves = 0;
+    for (auto& e : events) if (e.eventType == entity::reviewevent::APPROVE) ++approves;
+    ASSERT_EQ(approves, 1);
+    auto task = mainDao.findById(taskId);
+    ASSERT_STR_EQ(task->status, entity::reviewstatus::APPROVED);
+    ASSERT_EQ(task->version, 2); // 指派 + 结论
+}
+
+// 沿用原有损伤查询能力：队列联表仍可取到 FLAW 展示字段
+TEST(Review_PaginationJoinsFlawFields) {
+    cleanAllTables();
+    dao::ReviewDAO dao;
+    long long taskId = dao.enqueue(insertFlawForReview("corrosion", 5, 3)).taskId;
+    dao.assign(taskId, "supervisor_bai", "alice");
+    auto page = dao.pageByCamera(3, "", 0, 10);
+    ASSERT_EQ(page.items.size(), (size_t)1);
+    ASSERT_STR_EQ(page.items[0].category, "corrosion");
+    ASSERT_STR_EQ(page.items[0].flawDate, "2026-09-21");
+    ASSERT_EQ(page.items[0].task.flawId, dao.findById(taskId)->flawId);
+
+    dao::FlawDAO flawDao;
+    auto flaws = flawDao.findByLevel(5);
+    ASSERT_EQ(flaws.size(), (size_t)1);
 }
 
 // ============================================

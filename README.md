@@ -23,4 +23,4 @@ docker compose logs -f backend
 
 ## 数据范围
 
-初始化脚本创建 SPEED、SPLICE、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 七张表。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。
+初始化脚本创建 SPEED、SPLICE、FLAW、STOP、COMPARE、HISTORY 和 REMOVE 七张基础表，以及建立在 FLAW 之上的复核队列两张表：REVIEW_TASK（每条损伤至多一条复核任务，记录 PENDING/ASSIGNED/APPROVED/REJECTED 状态、当前负责人、指派与结论的操作者和时间）与 REVIEW_EVENT（仅追加的责任轨迹，记录 CREATE/ASSIGN/TRANSFER/APPROVE/REJECT，转派与驳回的理由由数据库 CHECK 约束强制）。结论只能由当前负责人通过条件更新提交，并发/重送提交会得到 SUBMITTED、NOT_OWNER、ALREADY_DECIDED、TASK_NOT_FOUND 等可区分的业务结果；主管按级别、摄像头、负责人的翻页查询走 REVIEW_TASK 上的复合索引并以任务ID为键集游标，不漏不重。字段含义、默认值和索引以 SQL 脚本为准；应用通过 DAO 执行增删改查并在关键操作处记录日志。

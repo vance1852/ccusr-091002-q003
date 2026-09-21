@@ -23,6 +23,7 @@
 #include "dao/CompareDAO.h"
 #include "dao/HistoryDAO.h"
 #include "dao/RemoveDAO.h"
+#include "dao/ReviewDAO.h"
 
 using namespace std;
 
@@ -240,8 +241,52 @@ static void demoHistory(dao::HistoryDAO& historyDao) {
     printResult("DELETE", true);
 }
 
-static void demoRemove(dao::RemoveDAO& removeDao) {
-    printSeparator("REMOVE 移除表 CRUD");
+static void demoReview() {
+    printSeparator("REVIEW 损伤复核队列：入队→指派→转派→结论");
+    dao::FlawDAO flawDao;
+    dao::ReviewDAO reviewDao;
+
+    entity::Flaw f;
+    f.category = "crack"; f.level = 4; f.url = "/data/flaw/review_001.jpg";
+    f.camera = 7; f.location = 2500.0f; f.distance = 180.0f;
+    f.size = "15x8mm"; f.coordinate = "X:120,Y:340";
+    f.date = "2026-09-21"; f.time = 30.5f;
+    long long flawId = flawDao.insert(f);
+
+    auto enq = reviewDao.enqueue(flawId, "night_algorithm");
+    printResult("ENQUEUE flaw id=" + to_string(flawId),
+                enq.result == dao::EnqueueResult::OK);
+    long long taskId = enq.taskId;
+
+    printResult("ASSIGN -> alice (by supervisor_bai)",
+                reviewDao.assign(taskId, "supervisor_bai", "alice") == dao::AssignResult::OK);
+    printResult("TRANSFER alice -> carol (reason required)",
+                reviewDao.transfer(taskId, "supervisor_bai", "carol", "alice 离岗")
+                    == dao::AssignResult::OK);
+
+    auto stale = reviewDao.decide(taskId, "alice", true);
+    printResult("stale owner alice rejected: " + string("NOT_OWNER"),
+                stale.result == dao::DecisionResult::NOT_OWNER);
+
+    auto decided = reviewDao.decide(taskId, "carol", false, "证据不足，驳回重采");
+    printResult("carol REJECT with reason", decided.result == dao::DecisionResult::SUBMITTED);
+
+    auto resend = reviewDao.decide(taskId, "carol", false, "证据不足，驳回重采");
+    printResult("client resend: ALREADY_DECIDED",
+                resend.result == dao::DecisionResult::ALREADY_DECIDED);
+
+    for (const auto& e : reviewDao.findEvents(taskId)) {
+        cout << "    trail: " << e.eventType << " by " << e.actor
+             << (e.fromAssignee.empty() ? "" : " from=" + e.fromAssignee)
+             << (e.toAssignee.empty() ? "" : " to=" + e.toAssignee)
+             << (e.reason.empty() ? "" : " reason=" + e.reason) << endl;
+    }
+
+    auto page = reviewDao.pageByCamera(7, "", 0, 10);
+    cout << "  pageByCamera(7) returned " << page.items.size() << " task(s)" << endl;
+}
+
+static void demoRemove(dao::RemoveDAO& removeDao) {    printSeparator("REMOVE 移除表 CRUD");
 
     long long id = removeDao.insert();
     printResult("INSERT remove (id=" + to_string(id) + ")", id > 0);
@@ -297,6 +342,7 @@ int main() {
         demoStop(stopDao);
         demoCompare(compareDao);
         demoHistory(historyDao);
+        demoReview();
         demoRemove(removeDao);
 
         // 6. 关闭连接

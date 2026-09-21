@@ -6,11 +6,17 @@
 
 namespace dao {
 
-    // DAO 基类，提供通用工具方法
+    // DAO 基类，提供通用工具方法。
+    // 默认使用 DatabaseManager 单例连接；构造时注入 db::Connection
+    // 可让 DAO 运行在独立会话上（并发/独立事务场景）。
     class BaseDAO {
+    public:
+        BaseDAO() = default;
+        explicit BaseDAO(db::Connection* conn) : conn_(conn) {}
+
     protected:
-        db::DatabaseManager& db() {
-            return db::DatabaseManager::instance();
+        db::Connection& db() {
+            return conn_ ? *conn_ : db::DatabaseManager::instance().connection();
         }
 
         // 安全转义字符串
@@ -55,6 +61,9 @@ namespace dao {
             std::string v = getVal(row, key);
             return v.empty() ? 0.0f : std::stof(v);
         }
+
+    private:
+        db::Connection* conn_ = nullptr;
     };
 
 } // namespace dao

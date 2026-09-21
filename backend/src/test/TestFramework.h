@@ -109,6 +109,12 @@ namespace test {
         test::fail(__FILE__, __LINE__, _oss.str()); \
     }
 
+#define ASSERT_LT(a, b) \
+    if (!((a) < (b))) { \
+        std::ostringstream _oss; _oss << "ASSERT_LT failed: " << (a) << " >= " << (b); \
+        test::fail(__FILE__, __LINE__, _oss.str()); \
+    }
+
 #define ASSERT_FLOAT_EQ(a, b) \
     if (std::fabs((a) - (b)) > 0.01f) { \
         std::ostringstream _oss; _oss << "ASSERT_FLOAT_EQ failed: " << (a) << " != " << (b); \

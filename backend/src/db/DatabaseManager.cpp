@@ -5,14 +5,16 @@ namespace db {
 
     static const char* TAG = "DatabaseManager";
 
-    void DatabaseManager::init(const config::DatabaseConfig& cfg) {
-        config_ = cfg;
+    // ============================================
+    // Connection
+    // ============================================
+
+    Connection::Connection(const config::DatabaseConfig& cfg) {
         conn_ = mysql_init(nullptr);
         if (!conn_) {
             throw DatabaseException("mysql_init() failed: out of memory");
         }
 
-        // 设置连接选项
         unsigned int timeout = cfg.connectTimeout;
         mysql_options(conn_, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
 
@@ -21,61 +23,60 @@ namespace db {
 
         mysql_options(conn_, MYSQL_SET_CHARSET_NAME, cfg.charset.c_str());
 
-        // 建立连接
-        if (!mysql_real_connect(conn_,
+        if (mysql_real_connect(conn_,
                 cfg.host.c_str(),
                 cfg.user.c_str(),
                 cfg.password.c_str(),
                 cfg.database.c_str(),
                 cfg.port, nullptr, 0)) {
-            std::string err = "Connection failed: ";
-            err += mysql_error(conn_);
-            mysql_close(conn_);
-            conn_ = nullptr;
-            throw DatabaseException(err);
+            connected_ = true;
+            LOG_INFO(TAG, "Connection opened to " + cfg.host + ":" + std::to_string(cfg.port) + "/" + cfg.database);
+            return;
         }
 
-        connected_ = true;
-        LOG_INFO(TAG, "Database connected to " + cfg.host + ":" + std::to_string(cfg.port) + "/" + cfg.database);
+        int code = mysql_errno(conn_);
+        std::string err = "Connection failed: ";
+        err += mysql_error(conn_);
+        mysql_close(conn_);
+        conn_ = nullptr;
+        throw DatabaseException(code, err);
     }
 
-    void DatabaseManager::close() {
+    Connection::~Connection() {
+        close();
+    }
+
+    void Connection::close() {
         if (conn_) {
             mysql_close(conn_);
             conn_ = nullptr;
             connected_ = false;
-            LOG_INFO(TAG, "Database connection closed");
         }
     }
 
-    DatabaseManager::~DatabaseManager() {
-        close();
-    }
-
-    void DatabaseManager::ensureConnected() {
+    void Connection::ensureConnected() {
         if (!conn_ || !connected_) {
-            throw DatabaseException("Database not connected. Call init() first.");
+            throw DatabaseException("Database not connected.");
         }
         if (mysql_ping(conn_) != 0) {
-            LOG_WARN(TAG, "Connection lost, attempting reconnect...");
-            reconnect();
+            throw DatabaseException(mysql_errno(conn_),
+                std::string("Connection lost: ") + mysql_error(conn_));
         }
     }
 
-    void DatabaseManager::reconnect() {
-        close();
-        init(config_);
+    void Connection::raiseError(const std::string& prefix) {
+        int code = mysql_errno(conn_);
+        std::string err = prefix + ": " + mysql_error(conn_);
+        LOG_ERROR(TAG, err);
+        throw DatabaseException(code, err);
     }
 
-    int DatabaseManager::execute(const std::string& sql) {
+    int Connection::execute(const std::string& sql) {
         ensureConnected();
         LOG_DEBUG(TAG, "Execute: " + sql);
 
         if (mysql_query(conn_, sql.c_str()) != 0) {
-            std::string err = "Execute failed: ";
-            err += mysql_error(conn_);
-            LOG_ERROR(TAG, err);
-            throw DatabaseException(err);
+            raiseError("Execute failed");
         }
 
         int affected = static_cast<int>(mysql_affected_rows(conn_));
@@ -83,15 +84,12 @@ namespace db {
         return affected;
     }
 
-    ResultSet DatabaseManager::query(const std::string& sql) {
+    ResultSet Connection::query(const std::string& sql) {
         ensureConnected();
         LOG_DEBUG(TAG, "Query: " + sql);
 
         if (mysql_query(conn_, sql.c_str()) != 0) {
-            std::string err = "Query failed: ";
-            err += mysql_error(conn_);
-            LOG_ERROR(TAG, err);
-            throw DatabaseException(err);
+            raiseError("Query failed");
         }
 
         MYSQL_RES* result = mysql_store_result(conn_);
@@ -99,9 +97,7 @@ namespace db {
             if (mysql_field_count(conn_) == 0) {
                 return {}; // 非 SELECT 语句
             }
-            std::string err = "Store result failed: ";
-            err += mysql_error(conn_);
-            throw DatabaseException(err);
+            raiseError("Store result failed");
         }
 
         ResultSet rows;
@@ -125,15 +121,12 @@ namespace db {
         return rows;
     }
 
-    long long DatabaseManager::insertAndGetId(const std::string& sql) {
+    long long Connection::insertAndGetId(const std::string& sql) {
         ensureConnected();
         LOG_DEBUG(TAG, "InsertAndGetId: " + sql);
 
         if (mysql_query(conn_, sql.c_str()) != 0) {
-            std::string err = "Insert failed: ";
-            err += mysql_error(conn_);
-            LOG_ERROR(TAG, err);
-            throw DatabaseException(err);
+            raiseError("Insert failed");
         }
 
         long long id = static_cast<long long>(mysql_insert_id(conn_));
@@ -141,15 +134,63 @@ namespace db {
         return id;
     }
 
-    std::string DatabaseManager::escape(const std::string& str) {
+    std::string Connection::escape(const std::string& str) {
         ensureConnected();
         std::vector<char> buf(str.size() * 2 + 1);
         mysql_real_escape_string(conn_, buf.data(), str.c_str(), static_cast<unsigned long>(str.size()));
         return std::string(buf.data());
     }
 
-    bool DatabaseManager::isConnected() const {
+    void Connection::begin()    { execute("START TRANSACTION"); }
+    void Connection::commit()   { execute("COMMIT"); }
+    void Connection::rollback() { execute("ROLLBACK"); }
+
+    bool Connection::isConnected() const {
         return connected_ && conn_ != nullptr;
     }
+
+    // ============================================
+    // DatabaseManager
+    // ============================================
+
+    void DatabaseManager::init(const config::DatabaseConfig& cfg) {
+        conn_ = std::make_unique<Connection>(cfg);
+    }
+
+    void DatabaseManager::close() {
+        if (conn_) {
+            conn_->close();
+            conn_.reset();
+            LOG_INFO(TAG, "Database connection closed");
+        }
+    }
+
+    DatabaseManager::~DatabaseManager() {
+        close();
+    }
+
+    Connection& DatabaseManager::connection() {
+        if (!conn_) {
+            throw DatabaseException("Database not connected. Call init() first.");
+        }
+        return *conn_;
+    }
+
+    std::unique_ptr<Connection> DatabaseManager::openConnection(const config::DatabaseConfig& cfg) {
+        return std::make_unique<Connection>(cfg);
+    }
+
+    int DatabaseManager::execute(const std::string& sql) { return connection().execute(sql); }
+    ResultSet DatabaseManager::query(const std::string& sql) { return connection().query(sql); }
+    long long DatabaseManager::insertAndGetId(const std::string& sql) { return connection().insertAndGetId(sql); }
+    std::string DatabaseManager::escape(const std::string& str) { return connection().escape(str); }
+
+    bool DatabaseManager::isConnected() const {
+        return conn_ && conn_->isConnected();
+    }
+
+    void DatabaseManager::begin()    { connection().begin(); }
+    void DatabaseManager::commit()   { connection().commit(); }
+    void DatabaseManager::rollback() { connection().rollback(); }
 
 } // namespace db
